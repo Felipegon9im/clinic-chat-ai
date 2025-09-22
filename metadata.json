@@ -1,0 +1,5 @@
+{
+  "name": "Copy of Clínica Vehe - Chat de Agendamento",
+  "description": "Chatbot de agendamento para a Clínica Vehe, com um fluxo de conversa guiado para seleção de serviços específicos e integração em tempo real com o Google Sheets.",
+  "requestFramePermissions": []
+}

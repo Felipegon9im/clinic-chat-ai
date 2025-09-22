@@ -1,0 +1,218 @@
+//
+// --- Google Apps Script para Agendamento da Clínica Vehe ---
+//
+// INSTRUÇÕES DE SETUP:
+// 1. CRIE UMA PLANILHA GOOGLE:
+//    - Crie uma nova planilha.
+//    - Renomeie a primeira página para "Agendamentos".
+//    - Crie uma segunda página e renomeie-a para "Config".
+//
+// 2. CONFIGURE AS PÁGINAS:
+//    - Na página "Agendamentos", crie os seguintes cabeçalhos na primeira linha:
+//      A1: Data, B1: Hora, C1: Nome, D1: Serviço, E1: Email, F1: WhatsApp
+//    - Na página "Config", configure o seguinte:
+//      A1: Horários
+//      B1: Email Proprietário
+//    - Na página "Config", preencha os dados:
+//      - Na coluna A (a partir de A2), liste todos os horários de atendimento (ex: 09:00, 10:00).
+//      - Na célula B2, insira o email que receberá as notificações de agendamento.
+//
+// 3. IMPLANTE ESTE SCRIPT:
+//    - Na sua planilha, vá em "Extensões" > "Apps Script".
+//    - Apague qualquer código existente e cole este código completo.
+//    - Salve o projeto (ícone de disquete).
+//    - Clique em "Implantar" > "Nova implantação".
+//    - No pop-up, clique no ícone de engrenagem e selecione "App da Web".
+//    - Em "Configuração", faça o seguinte:
+//      - Executar como: "Eu"
+//      - Quem pode acessar: "Qualquer pessoa" (IMPORTANTE!)
+//    - Clique em "Implantar".
+//    - O Google pedirá autorização. Clique em "Autorizar acesso".
+//    - Após a implantação, copie a "URL do app da Web".
+//    - COLE ESTA URL na constante `APPS_SCRIPT_URL` no arquivo `services/googleSheetsService.ts` do seu projeto.
+//
+
+const SPREADSHEET_ID = SpreadsheetApp.getActiveSpreadsheet().getId();
+const agendamentosSheet = SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName("Agendamentos");
+const configSheet = SpreadsheetApp.openById(SPREADSHEET_ID).getSheetByName("Config");
+
+// Lida com requisições GET (leitura de dados)
+function doGet(e) {
+  const action = e.parameter.action;
+
+  try {
+    if (action === "getAvailableDates") {
+      const dates = getAvailableDates();
+      return createJsonResponse({ success: true, data: dates });
+    }
+    if (action === "getAvailableSlots") {
+      const date = e.parameter.date;
+      if (!date) throw new Error("A data é obrigatória.");
+      const slots = getAvailableSlots(date);
+      return createJsonResponse({ success: true, data: slots });
+    }
+    throw new Error("Ação inválida.");
+  } catch (error) {
+    return createJsonResponse({ success: false, error: error.message });
+  }
+}
+
+// Lida com requisições POST (escrita de dados)
+function doPost(e) {
+  try {
+    const data = JSON.parse(e.postData.contents);
+    
+    if (data.action === 'bookAppointment') {
+      const appointmentDetails = data.appointment;
+      if (!appointmentDetails.date || !appointmentDetails.time || !appointmentDetails.name || !appointmentDetails.service || !appointmentDetails.phone || !appointmentDetails.email) {
+        throw new Error("Dados do agendamento incompletos.");
+      }
+      bookAppointment(appointmentDetails);
+      sendConfirmationEmails(appointmentDetails);
+      return createJsonResponse({ success: true, message: "Agendamento realizado." });
+
+    } else if (data.action === 'cancelAppointment') {
+      const cancellationDetails = data.details;
+       if (!cancellationDetails.email || !cancellationDetails.date) {
+        throw new Error("Email e data são necessários para o cancelamento.");
+      }
+      const result = cancelAppointmentOnSheet(cancellationDetails);
+      if (result.success) {
+        sendCancellationEmails(result.details);
+        return createJsonResponse({ success: true, message: "Agendamento cancelado." });
+      } else {
+        throw new Error("Nenhum agendamento encontrado com os dados fornecidos.");
+      }
+
+    } else {
+      throw new Error("Ação de POST inválida.");
+    }
+  } catch (error) {
+    return createJsonResponse({ success: false, error: error.message });
+  }
+}
+
+function createJsonResponse(obj) {
+  return ContentService.createTextOutput(JSON.stringify(obj)).setMimeType(ContentService.MimeType.JSON);
+}
+
+// --- Funções de Agendamento ---
+
+function bookAppointment(details) {
+  if (!agendamentosSheet) throw new Error("A página 'Agendamentos' não foi encontrada.");
+  agendamentosSheet.appendRow([details.date, details.time, details.name, details.service, details.email, details.phone]);
+}
+
+function sendConfirmationEmails(details) {
+  const ownerEmail = configSheet.getRange("B2").getValue();
+  if (!ownerEmail) throw new Error("Email do proprietário não configurado na aba 'Config'.");
+
+  const subjectClient = "Confirmação de Agendamento - Clínica Vehe";
+  const bodyClient = `Olá, ${details.name}!\n\nSeu agendamento na Clínica Vehe foi confirmado com sucesso.\n\nDetalhes:\n- Serviço: ${details.service}\n- Data: ${details.date}\n- Hora: ${details.time}\n\nAté breve!\nEquipe Clínica Vehe`;
+  
+  const subjectOwner = `Novo Agendamento: ${details.name} - ${details.date}`;
+  const bodyOwner = `Um novo agendamento foi realizado através do chatbot.\n\nDetalhes:\n- Cliente: ${details.name}\n- Email: ${details.email}\n- WhatsApp: ${details.phone}\n- Serviço: ${details.service}\n- Data: ${details.date}\n- Hora: ${details.time}`;
+
+  MailApp.sendEmail(details.email, subjectClient, bodyClient);
+  MailApp.sendEmail(ownerEmail, subjectOwner, bodyOwner);
+}
+
+// --- Funções de Cancelamento ---
+
+function cancelAppointmentOnSheet(details) {
+  if (!agendamentosSheet) throw new Error("A página 'Agendamentos' não foi encontrada.");
+  
+  const data = agendamentosSheet.getDataRange().getDisplayValues(); // Usar getDisplayValues para comparar datas como string
+  
+  // Iterar de trás para frente para evitar problemas de índice ao remover linhas
+  for (let i = data.length - 1; i >= 1; i--) { 
+    const row = data[i];
+    const rowDate = row[0];   // Data (dd/MM/yyyy)
+    const rowEmail = row[4];  // Email na coluna E
+
+    if (rowDate === details.date && rowEmail.trim().toLowerCase() === details.email.trim().toLowerCase()) {
+      const cancelledDetails = {
+        date: row[0],
+        time: row[1],
+        name: row[2],
+        service: row[3],
+        email: row[4]
+      };
+      agendamentosSheet.deleteRow(i + 1); // +1 porque os índices de linha são baseados em 1
+      return { success: true, details: cancelledDetails };
+    }
+  }
+  
+  return { success: false }; // Nenhum agendamento encontrado
+}
+
+function sendCancellationEmails(details) {
+  const ownerEmail = configSheet.getRange("B2").getValue();
+  if (!ownerEmail) throw new Error("Email do proprietário não configurado.");
+
+  const subjectClient = "Cancelamento de Agendamento - Clínica Vehe";
+  const bodyClient = `Olá, ${details.name}.\n\nConfirmamos o cancelamento do seu agendamento para o serviço "${details.service}" no dia ${details.date} às ${details.time}.\n\nEsperamos vê-lo(a) em breve.\n\nEquipe Clínica Vehe`;
+
+  const subjectOwner = `Agendamento Cancelado: ${details.name} - ${details.date}`;
+  const bodyOwner = `O agendamento abaixo foi cancelado pelo cliente:\n\n- Cliente: ${details.name}\n- Email: ${details.email}\n- Serviço: ${details.service}\n- Data: ${details.date}\n- Hora: ${details.time}`;
+
+  MailApp.sendEmail(details.email, subjectClient, bodyClient);
+  MailApp.sendEmail(ownerEmail, subjectOwner, bodyOwner);
+}
+
+
+// --- Funções de Disponibilidade ---
+
+function getAllPossibleSlots() {
+  if (!configSheet) return [];
+  const lastRow = configSheet.getLastRow();
+  if (lastRow < 2) return [];
+  // Usar getDisplayValues para garantir que as horas sejam lidas como strings
+  return configSheet.getRange(2, 1, lastRow - 1, 1).getDisplayValues().flat().filter(String);
+}
+
+function getBookedSlots(dateStr) {
+  if (!agendamentosSheet) return [];
+  // Usar getDisplayValues para ler datas e horas como strings formatadas, evitando problemas de fuso horário
+  const data = agendamentosSheet.getDataRange().getDisplayValues();
+  const bookedSlots = [];
+  
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][0] === dateStr) { // Compara a string de data diretamente
+      bookedSlots.push(data[i][1]); // Adiciona a string da hora
+    }
+  }
+  return bookedSlots;
+}
+
+function getAvailableSlots(dateStr) {
+  const bookedSlots = getBookedSlots(dateStr);
+  const allSlots = getAllPossibleSlots();
+  return allSlots.filter(slot => !bookedSlots.includes(slot));
+}
+
+function getAvailableDates() {
+    const allSlots = getAllPossibleSlots();
+    if (allSlots.length === 0) return [];
+
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+
+    const availableDates = [];
+    // Buscar nos próximos 30 dias por até 5 datas com vagas
+    for (let i = 0; i < 30; i++) {
+        const currentDate = new Date(today);
+        currentDate.setDate(today.getDate() + i);
+
+        // Formata a data para dd/MM/yyyy para ser compatível com a planilha
+        const dateStr = Utilities.formatDate(currentDate, Session.getScriptTimeZone(), "dd/MM/yyyy");
+
+        const bookedSlots = getBookedSlots(dateStr);
+        if (bookedSlots.length < allSlots.length) {
+            availableDates.push(dateStr);
+        }
+
+        if(availableDates.length >= 5) break; // Limita a 5 opções para o usuário
+    }
+    return availableDates;
+}
